@@ -1,0 +1,5 @@
+* text=auto
+
+# Files executed on Linux nodes must keep LF endings regardless of checkout platform.
+*.sh text eol=lf
+*.service text eol=lf

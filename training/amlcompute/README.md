@@ -1,67 +1,60 @@
-# AML compute durable storage runner
+# AML compute operations
 
-This automation dynamically obtains the active node IP and port from the Azure
-Machine Learning `listNodes` REST response, connects over SSH, mounts the
-configured Blob container, and installs a background sanity heartbeat.
+This directory contains the tools used to run Baron training on Azure Machine Learning compute nodes. The controller finds an available node, prepares storage and services, starts training when enabled, and reports progress.
 
-Authentication uses the configured user-assigned managed identity when AML
-exposes it to the host through IMDS. AML cluster host nodes may expose identities
-only to submitted job containers; in that case the bootstrap retrieves a storage
-account key and stores it in `/etc/baron-storage.env` with root-only permissions.
-The SSH password remains in the git-ignored local `.env` file as requested.
+## Main files
 
-## Prerequisites
+| File | Purpose |
+| --- | --- |
+| `amlrunner.py` | Finds a node, checks its health, repairs it when needed, and monitors training. |
+| `remote/bootstrap.sh` | Installs and configures storage and training services on the node. |
+| `remote/run-training.sh` | Checks the node and starts the training container. |
 
-- Azure CLI authenticated to the Microsoft tenant and authorized for both subscriptions.
-- Python 3.10 or newer.
-- Dependencies installed from this directory's `requirements.txt`.
-- `.env` populated using `.env.example` as its template.
+## Setup
 
-## Bootstrap
+You need:
 
-From the repository root:
+- Azure CLI signed in with access to AML, the storage account, and the container registry.
+- Python 3.10 or newer with `training/amlcompute/requirements.txt` installed.
+- A `.env` file based on `.env.example`.
+- An SSH user that can run `sudo`.
 
-    python -m pip install -r training/amlcompute/requirements.txt
-    python training/amlcompute/amlrunner.py bootstrap
+Set `AML_COMPUTE_RESOURCE_IDS` to a comma-separated list of AML compute resource IDs. The runner checks them in the order listed. All computes must use the same SSH credentials.
 
-Bootstrap is idempotent and convergent:
+## Run
 
-- The Blob container `PUT` creates or updates the same container.
-- BlobFuse2 is installed only when absent.
-- Directories are safely recreated with `install -d`.
-- Scripts, credentials, and systemd unit definitions are replaced with the desired content.
-- `systemctl enable` is safe when already enabled.
-- Services are restarted and health-checked, so configuration changes take effect.
-- Existing durable blobs are not deleted or overwritten, except `sanity/latest.txt`.
+Start the controller and keep it running:
 
-Running bootstrap again can briefly interrupt the mount because it intentionally
-restarts the services, but it does not create duplicate services or mounts.
+    python training/amlcompute/amlrunner.py run
 
-## Handle replacement nodes continuously
+Check and repair once, then exit:
 
-    python training/amlcompute/amlrunner.py bootstrap --watch --interval 60
+    python training/amlcompute/amlrunner.py run --once
 
-Watch mode re-queries AML every minute. It leaves a healthy current node alone
-and idempotently bootstraps a new or unhealthy node. It must run on an always-on
-controller because an evicted AML node cannot bootstrap its replacement.
+Change the check interval:
 
-## Stop
+    python training/amlcompute/amlrunner.py run --interval 60
+
+Stop training and unmount storage on the selected node:
 
     python training/amlcompute/amlrunner.py stop
 
-Stop dynamically locates the current node, stops and disables both services,
-unmounts storage, and verifies the stopped state. Calling stop again is safe.
-It does not uninstall BlobFuse2, remove unit definitions, delete credentials, or
-delete anything in Blob Storage; a later bootstrap starts everything again.
+## How node selection works
 
-## Remote paths and logs
+The runner remembers the selected compute and node in `.state/selected-node.json`. It reuses that node when it still belongs to the same training run. Otherwise, it chooses the first Idle node from the configured computes. It will not take a busy node that may belong to someone else.
 
-- Mounted Blob container: `/mnt/baron-training`
-- Durable latest heartbeat: `/mnt/baron-training/sanity/latest.txt`
-- Durable heartbeat history: `/mnt/baron-training/sanity/logs/`
-- Mount service logs: `journalctl -u baron-blobfuse2`
-- Sanity service logs: `journalctl -u baron-sanity`
+The logs include both the compute name and node ID. Logs are written to the terminal and to `training/amlcompute/.state/amlrunner.log`.
 
-Training should write completed, versioned checkpoints beneath the mounted path.
-For large checkpoints, write locally first and move or copy the completed artifact
-into the mount; BlobFuse is not a fully POSIX-compatible filesystem.
+## Storage and credentials
+
+Training data is mounted with BlobFuse2 at `BARON_DURABLE_PATH` (`/mnt/baron-training` by default), and node-local scratch lives at `BARON_LOCAL_PATH` (`/mnt/baron-local` by default). Both directories are created by `bootstrap.sh` and owned by the service user. The runner checks the mount before training starts and repairs it when needed.
+
+The storage account key is kept in `/etc/baron-storage.env` on the node with permissions limited to root. It is not passed to the training container or written to the logs.
+
+## Training behavior
+
+Set `BARON_TRAINING_ENABLED=true` to run real training. When it is `false` or not set, the runner performs a storage dry run instead.
+
+`BARON_RUN_ID` is required for real training. A dry run uses `dry-run` when no run ID is set.
+
+Temporary failures restart the same run. Fatal failures create `runs/<run-id>/HALT.json` and stop restarting. Run state is reported in `runs/<run-id>/status.json`, which records `running`, `completed`, `retryable`, or `fatal`.
