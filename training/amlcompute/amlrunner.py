@@ -7,19 +7,18 @@ import argparse
 import io
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
-from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import subprocess
-import sys
 import time
+import uuid
+from logging.handlers import RotatingFileHandler
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import paramiko
 from dotenv import load_dotenv
-
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
@@ -92,8 +91,16 @@ def load_settings() -> dict[str, Any]:
     ssh_user = required_env("AML_SSH_USER")
     compute_ids = required_env("AML_COMPUTE_RESOURCE_IDS")
     training_enabled = os.environ.get("BARON_TRAINING_ENABLED", "false").strip().lower()
+    registry_username = os.environ.get("ACR_USERNAME", "").strip()
+    registry_password = os.environ.get("ACR_PASSWORD", "")
     if training_enabled not in {"true", "false"}:
         raise AutomationError("BARON_TRAINING_ENABLED must be true or false")
+    if bool(registry_username) != bool(registry_password):
+        raise AutomationError(
+            "ACR_USERNAME and ACR_PASSWORD must be configured together"
+        )
+    if "\n" in registry_password or "\r" in registry_password:
+        raise AutomationError("ACR_PASSWORD must not contain newlines")
     return {
         "aml_compute_ids": parse_compute_resource_ids(compute_ids),
         "storage_account_id": required_env("STORAGE_ACCOUNT_RESOURCE_ID").rstrip("/"),
@@ -111,7 +118,9 @@ def load_settings() -> dict[str, Any]:
         "dry_run_interval": os.environ.get(
             "BARON_DRY_RUN_INTERVAL_SECONDS", "1"
         ).strip(),
-        "image": os.environ.get("BARON_IMAGE", "").strip(),
+        "image": required_env("BARON_IMAGE"),
+        "registry_username": registry_username,
+        "registry_password": registry_password,
         "config_path": os.environ.get("BARON_CONFIG_PATH", "").strip(),
         "config_hash": os.environ.get("BARON_CONFIG_HASH", "").strip(),
         "progress_timeout": os.environ.get(
@@ -270,7 +279,21 @@ def find_selected_node(
     )
 
 
-def connect(node: dict[str, Any], settings: dict[str, Any]) -> paramiko.SSHClient:
+def remove_known_host(host: str, port: int) -> bool:
+    if not KNOWN_HOSTS.exists():
+        return False
+    endpoint = host if port == 22 else f"[{host}]:{port}"
+    host_keys = paramiko.HostKeys(str(KNOWN_HOSTS))
+    if endpoint not in host_keys:
+        return False
+    del host_keys[endpoint]
+    host_keys.save(str(KNOWN_HOSTS))
+    return True
+
+
+def _connect_once(
+    node: dict[str, Any], settings: dict[str, Any]
+) -> paramiko.SSHClient:
     STATE_DIR.mkdir(exist_ok=True)
     client = paramiko.SSHClient()
     if KNOWN_HOSTS.exists():
@@ -289,6 +312,23 @@ def connect(node: dict[str, Any], settings: dict[str, Any]) -> paramiko.SSHClien
     )
     client.save_host_keys(str(KNOWN_HOSTS))
     return client
+
+
+def connect(node: dict[str, Any], settings: dict[str, Any]) -> paramiko.SSHClient:
+    try:
+        return _connect_once(node, settings)
+    except paramiko.BadHostKeyException:
+        if not remove_known_host(node["host"], node["port"]):
+            raise
+        LOGGER.warning(
+            "replacing stale SSH host key for ARM-discovered AML node "
+            "compute=%s node=%s endpoint=%s:%s",
+            node["compute_name"],
+            node["node_id"],
+            node["host"],
+            node["port"],
+        )
+        return _connect_once(node, settings)
 
 
 def remote_command(
@@ -349,6 +389,89 @@ def training_environment(settings: dict[str, Any]) -> str:
     if any("\n" in value or "\r" in value for value in values.values()):
         raise AutomationError("Training settings must not contain newlines")
     return "".join(f"{name}={shlex.quote(value)}\n" for name, value in values.items())
+
+
+def ensure_remote_image(
+    client: paramiko.SSHClient, settings: dict[str, Any]
+) -> None:
+    image = settings["image"]
+    inspect_command = "sudo -S -p '' -- docker image inspect " + shlex.quote(image)
+    code, _, _ = remote_command(
+        client,
+        inspect_command,
+        stdin_text=sudo_password(settings),
+        timeout=60,
+    )
+    if code == 0:
+        LOGGER.info("training image is already available locally")
+        return
+
+    username = settings["registry_username"]
+    password = settings["registry_password"]
+    if not username or not password:
+        raise AutomationError(
+            "Training image is not available locally and ACR credentials are missing"
+        )
+    registry, separator, _ = image.partition("/")
+    if not separator:
+        raise AutomationError("BARON_IMAGE must include a registry hostname")
+
+    auth_dir = f"/tmp/baron-docker-auth.{uuid.uuid4().hex}"
+    create_code, _, create_error = remote_command(
+        client,
+        "install -d -m 0700 " + shlex.quote(auth_dir),
+        timeout=60,
+    )
+    if create_code:
+        raise AutomationError(
+            f"Unable to create temporary Docker auth directory: {create_error.strip()}"
+        )
+    try:
+        login_command = (
+            "env DOCKER_CONFIG="
+            + shlex.quote(auth_dir)
+            + " docker login "
+            + shlex.quote(registry)
+            + " --username "
+            + shlex.quote(username)
+            + " --password-stdin"
+        )
+        login_code, login_output, login_error = remote_command(
+            client,
+            login_command,
+            stdin_text=password + "\n",
+            timeout=120,
+        )
+        if login_code:
+            raise AutomationError(
+                "ACR login failed: "
+                + (login_error.strip() or login_output.strip() or "unknown error")
+            )
+
+        pull_command = (
+            "sudo -S -p '' -- docker --config "
+            + shlex.quote(auth_dir)
+            + " pull "
+            + shlex.quote(image)
+        )
+        pull_code, pull_output, pull_error = remote_command(
+            client,
+            pull_command,
+            stdin_text=sudo_password(settings),
+            timeout=1200,
+        )
+        if pull_code:
+            raise AutomationError(
+                "Training image pull failed: "
+                + (pull_error.strip() or pull_output.strip() or "unknown error")
+            )
+        LOGGER.info("training image pulled successfully")
+    finally:
+        remote_command(
+            client,
+            "rm -rf -- " + shlex.quote(auth_dir),
+            timeout=60,
+        )
 
 
 def parse_training_observation(
@@ -517,6 +640,7 @@ def bootstrap_node(
         node["node_id"],
     )
     with connect(node, settings) as client:
+        ensure_remote_image(client, settings)
         LOGGER.info("using a root-protected storage account key for BlobFuse2")
         auth_environment = (
             f"AZURE_STORAGE_ACCOUNT={resource_name(settings['storage_account_id'])}\n"

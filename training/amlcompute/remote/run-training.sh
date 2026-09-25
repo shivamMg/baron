@@ -187,6 +187,7 @@ launch_container() {
     -e "BARON_RUN_ID=$BARON_RUN_ID"
     -e "BARON_TRAINING_ENABLED=$TRAINING_ENABLED"
     -e "BARON_DURABLE_PATH=/mnt/baron-training"
+    -e "BARON_CONFIG_PATH=${BARON_CONFIG_PATH:-/mnt/baron-training}"
     -v "$BARON_DURABLE_PATH:/mnt/baron-training"
   )
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -200,7 +201,6 @@ launch_container() {
       --gpus all --network host --ipc host --shm-size=16g
       -e "BARON_NUM_PROCESSES=$NUM_PROCESSES"
       -e "BARON_CONFIG_HASH=${BARON_CONFIG_HASH:-}"
-      -e "BARON_CONFIG_PATH=$BARON_CONFIG_PATH"
       -v "$BARON_LOCAL_PATH:/mnt/baron-local"
     )
   fi

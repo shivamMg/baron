@@ -21,6 +21,10 @@ You need:
 
 Set `AML_COMPUTE_RESOURCE_IDS` to a comma-separated list of AML compute resource IDs. The runner checks them in the order listed. All computes must use the same SSH credentials.
 
+AML may reimage a node while retaining its public endpoint. When the host key changes for a node returned by the authenticated ARM discovery API, the runner removes only that endpoint's stale key and retries once, then saves the replacement key.
+
+Set `BARON_IMAGE` to an immutable image digest. If the image may not already exist on a replacement node, configure `ACR_USERNAME` and `ACR_PASSWORD`; the runner uses them through a temporary Docker configuration to pull the image and removes that configuration before starting the service.
+
 ## Run
 
 Start the controller and keep it running:
@@ -50,6 +54,8 @@ The logs include both the compute name and node ID. Logs are written to the term
 Training data is mounted with BlobFuse2 at `BARON_DURABLE_PATH` (`/mnt/baron-training` by default), and node-local scratch lives at `BARON_LOCAL_PATH` (`/mnt/baron-local` by default). Both directories are created by `bootstrap.sh` and owned by the service user. The runner checks the mount before training starts and repairs it when needed.
 
 The storage account key is kept in `/etc/baron-storage.env` on the node with permissions limited to root. It is not passed to the training container or written to the logs.
+
+ACR credentials remain in the controller's local `.env`. They are not copied into `/etc/baron-training.env` or retained on the node after an image pull.
 
 ## Training behavior
 
